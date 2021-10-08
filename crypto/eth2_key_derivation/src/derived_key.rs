@@ -35,6 +35,11 @@ pub const MOD_R_L: usize = 48;
 #[zeroize(drop)]
 pub struct DerivedKey(ZeroizeHash);
 
+#[derive(Debug, PartialEq)]
+pub enum Error {
+    EmptySeed,
+}
+
 impl DerivedKey {
     /// Instantiates `Self` from some secret seed bytes.
     ///
@@ -42,10 +47,10 @@ impl DerivedKey {
     ///
     /// ## Errors
     ///
-    /// Returns `Err(())` if `seed.is_empty()`, otherwise always returns `Ok(self)`.
-    pub fn from_seed(seed: &[u8]) -> Result<Self, ()> {
+    /// Returns `Err(Error::EmptySeed)` if `seed.is_empty()`, otherwise always returns `Ok(self)`.
+    pub fn from_seed(seed: &[u8]) -> Result<Self, Error> {
         if seed.is_empty() {
-            Err(())
+            Err(Error::EmptySeed)
         } else {
             Ok(Self(derive_master_sk(seed)))
         }
@@ -122,7 +127,7 @@ fn mod_r(bytes: &[u8]) -> ZeroizeHash {
     debug_assert!(x_slice.len() <= HASH_SIZE);
 
     let mut output = ZeroizeHash::zero();
-    output.as_mut_bytes()[HASH_SIZE - x_slice.len()..].copy_from_slice(&x_slice);
+    output.as_mut_bytes()[HASH_SIZE - x_slice.len()..].copy_from_slice(x_slice);
     output
 }
 

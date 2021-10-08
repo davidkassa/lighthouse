@@ -96,7 +96,7 @@ pub struct SyncingChain<T: BeaconChainTypes> {
     validated_batches: u64,
 
     /// A multi-threaded, non-blocking processor for applying messages to the beacon chain.
-    beacon_processor_send: Sender<BeaconWorkEvent<T::EthSpec>>,
+    beacon_processor_send: Sender<BeaconWorkEvent<T>>,
 
     /// The chain's log.
     log: slog::Logger,
@@ -123,7 +123,7 @@ impl<T: BeaconChainTypes> SyncingChain<T> {
         target_head_slot: Slot,
         target_head_root: Hash256,
         peer_id: PeerId,
-        beacon_processor_send: Sender<BeaconWorkEvent<T::EthSpec>>,
+        beacon_processor_send: Sender<BeaconWorkEvent<T>>,
         log: &slog::Logger,
     ) -> Self {
         let mut peers = FnvHashMap::default();
@@ -161,7 +161,7 @@ impl<T: BeaconChainTypes> SyncingChain<T> {
     }
 
     /// Peers currently syncing this chain.
-    pub fn peers<'a>(&'a self) -> impl Iterator<Item = PeerId> + 'a {
+    pub fn peers(&self) -> impl Iterator<Item = PeerId> + '_ {
         self.peers.keys().cloned()
     }
 
@@ -181,7 +181,7 @@ impl<T: BeaconChainTypes> SyncingChain<T> {
             // fail the batches
             for id in batch_ids {
                 if let Some(batch) = self.batches.get_mut(&id) {
-                    if batch.download_failed()? {
+                    if batch.download_failed(true)? {
                         return Err(RemoveChain::ChainFailed(id));
                     }
                     self.retry_batch_download(network, id)?;
@@ -273,7 +273,7 @@ impl<T: BeaconChainTypes> SyncingChain<T> {
         }
     }
 
-    /// Sends to process the batch with the given id.
+    /// Processes the batch with the given id.
     /// The batch must exist and be ready for processing
     fn process_batch(
         &mut self,
@@ -794,7 +794,7 @@ impl<T: BeaconChainTypes> SyncingChain<T> {
             if let Some(active_requests) = self.peers.get_mut(peer_id) {
                 active_requests.remove(&batch_id);
             }
-            if batch.download_failed()? {
+            if batch.download_failed(true)? {
                 return Err(RemoveChain::ChainFailed(batch_id));
             }
             self.retry_batch_download(network, batch_id)
@@ -837,7 +837,7 @@ impl<T: BeaconChainTypes> SyncingChain<T> {
         }
     }
 
-    /// Requests the batch asigned to the given id from a given peer.
+    /// Requests the batch assigned to the given id from a given peer.
     pub fn send_batch(
         &mut self,
         network: &mut SyncNetworkContext<T::EthSpec>,
@@ -883,7 +883,7 @@ impl<T: BeaconChainTypes> SyncingChain<T> {
                     self.peers
                         .get_mut(&peer)
                         .map(|request| request.remove(&batch_id));
-                    if batch.download_failed()? {
+                    if batch.download_failed(true)? {
                         return Err(RemoveChain::ChainFailed(batch_id));
                     } else {
                         return self.retry_batch_download(network, batch_id);
@@ -933,10 +933,10 @@ impl<T: BeaconChainTypes> SyncingChain<T> {
         // check if we have the batch for our optimistic start. If not, request it first.
         // We wait for this batch before requesting any other batches.
         if let Some(epoch) = self.optimistic_start {
-            if !self.batches.contains_key(&epoch) {
+            if let Entry::Vacant(entry) = self.batches.entry(epoch) {
                 if let Some(peer) = idle_peers.pop() {
                     let optimistic_batch = BatchInfo::new(&epoch, EPOCHS_PER_BATCH);
-                    self.batches.insert(epoch, optimistic_batch);
+                    entry.insert(optimistic_batch);
                     self.send_batch(network, epoch, peer)?;
                 }
             }
@@ -963,7 +963,7 @@ impl<T: BeaconChainTypes> SyncingChain<T> {
         if self
             .to_be_downloaded
             .start_slot(T::EthSpec::slots_per_epoch())
-            > self.target_head_slot
+            >= self.target_head_slot
         {
             return None;
         }
@@ -990,7 +990,7 @@ impl<T: BeaconChainTypes> SyncingChain<T> {
         // this batch could have been included already being an optimistic batch
         match self.batches.entry(batch_id) {
             Entry::Occupied(_) => {
-                // this batch doesn't need downlading, let this same function decide the next batch
+                // this batch doesn't need downloading, let this same function decide the next batch
                 self.to_be_downloaded += EPOCHS_PER_BATCH;
                 self.include_next_batch()
             }

@@ -1,22 +1,25 @@
-use crate::beacon_node_fallback::{BeaconNodeFallback, RequireSynced};
+use crate::{
+    beacon_node_fallback::{BeaconNodeFallback, RequireSynced},
+    graffiti_file::GraffitiFile,
+};
 use crate::{http_metrics::metrics, validator_store::ValidatorStore};
 use environment::RuntimeContext;
 use eth2::types::Graffiti;
-use futures::channel::mpsc::Receiver;
-use futures::{StreamExt, TryFutureExt};
 use slog::{crit, debug, error, info, trace, warn};
 use slot_clock::SlotClock;
 use std::ops::Deref;
 use std::sync::Arc;
-use types::{EthSpec, PublicKey, Slot};
+use tokio::sync::mpsc;
+use types::{EthSpec, PublicKeyBytes, Slot};
 
 /// Builds a `BlockService`.
 pub struct BlockServiceBuilder<T, E: EthSpec> {
-    validator_store: Option<ValidatorStore<T, E>>,
+    validator_store: Option<Arc<ValidatorStore<T, E>>>,
     slot_clock: Option<Arc<T>>,
     beacon_nodes: Option<Arc<BeaconNodeFallback<T, E>>>,
     context: Option<RuntimeContext<E>>,
     graffiti: Option<Graffiti>,
+    graffiti_file: Option<GraffitiFile>,
 }
 
 impl<T: SlotClock + 'static, E: EthSpec> BlockServiceBuilder<T, E> {
@@ -27,10 +30,11 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockServiceBuilder<T, E> {
             beacon_nodes: None,
             context: None,
             graffiti: None,
+            graffiti_file: None,
         }
     }
 
-    pub fn validator_store(mut self, store: ValidatorStore<T, E>) -> Self {
+    pub fn validator_store(mut self, store: Arc<ValidatorStore<T, E>>) -> Self {
         self.validator_store = Some(store);
         self
     }
@@ -55,6 +59,11 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockServiceBuilder<T, E> {
         self
     }
 
+    pub fn graffiti_file(mut self, graffiti_file: Option<GraffitiFile>) -> Self {
+        self.graffiti_file = graffiti_file;
+        self
+    }
+
     pub fn build(self) -> Result<BlockService<T, E>, String> {
         Ok(BlockService {
             inner: Arc::new(Inner {
@@ -71,6 +80,7 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockServiceBuilder<T, E> {
                     .context
                     .ok_or("Cannot build BlockService without runtime_context")?,
                 graffiti: self.graffiti,
+                graffiti_file: self.graffiti_file,
             }),
         })
     }
@@ -78,11 +88,12 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockServiceBuilder<T, E> {
 
 /// Helper to minimise `Arc` usage.
 pub struct Inner<T, E: EthSpec> {
-    validator_store: ValidatorStore<T, E>,
+    validator_store: Arc<ValidatorStore<T, E>>,
     slot_clock: Arc<T>,
     beacon_nodes: Arc<BeaconNodeFallback<T, E>>,
     context: RuntimeContext<E>,
     graffiti: Option<Graffiti>,
+    graffiti_file: Option<GraffitiFile>,
 }
 
 /// Attempts to produce attestations for any block producer(s) at the start of the epoch.
@@ -109,13 +120,13 @@ impl<T, E: EthSpec> Deref for BlockService<T, E> {
 /// Notification from the duties service that we should try to produce a block.
 pub struct BlockServiceNotification {
     pub slot: Slot,
-    pub block_proposers: Vec<PublicKey>,
+    pub block_proposers: Vec<PublicKeyBytes>,
 }
 
 impl<T: SlotClock + 'static, E: EthSpec> BlockService<T, E> {
     pub fn start_update_service(
         self,
-        notification_rx: Receiver<BlockServiceNotification>,
+        mut notification_rx: mpsc::Receiver<BlockServiceNotification>,
     ) -> Result<(), String> {
         let log = self.context.log().clone();
 
@@ -123,14 +134,16 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockService<T, E> {
 
         let executor = self.inner.context.executor.clone();
 
-        let block_service_fut = notification_rx.for_each(move |notif| {
-            let service = self.clone();
+        executor.spawn(
             async move {
-                service.do_update(notif).await.ok();
-            }
-        });
-
-        executor.spawn(block_service_fut, "block_service");
+                while let Some(notif) = notification_rx.recv().await {
+                    let service = self.clone();
+                    service.do_update(notif).await.ok();
+                }
+                debug!(log, "Block service shutting down");
+            },
+            "block_service",
+        );
 
         Ok(())
     }
@@ -193,15 +206,15 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockService<T, E> {
             let service = self.clone();
             let log = log.clone();
             self.inner.context.executor.spawn(
-                service
-                    .publish_block(slot, validator_pubkey)
-                    .unwrap_or_else(move |e| {
+                async move {
+                    if let Err(e) = service.publish_block(slot, validator_pubkey).await {
                         crit!(
                             log,
                             "Error whilst producing block";
                             "message" => e
                         );
-                    }),
+                    }
+                },
                 "block service",
             );
         }
@@ -210,7 +223,11 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockService<T, E> {
     }
 
     /// Produce a block at the given slot for validator_pubkey
-    async fn publish_block(self, slot: Slot, validator_pubkey: PublicKey) -> Result<(), String> {
+    async fn publish_block(
+        self,
+        slot: Slot,
+        validator_pubkey: PublicKeyBytes,
+    ) -> Result<(), String> {
         let log = self.context.log();
         let _timer =
             metrics::start_timer_vec(&metrics::BLOCK_SERVICE_TIMES, &[metrics::BEACON_BLOCK]);
@@ -222,9 +239,23 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockService<T, E> {
 
         let randao_reveal = self
             .validator_store
-            .randao_reveal(&validator_pubkey, slot.epoch(E::slots_per_epoch()))
-            .ok_or("Unable to produce randao reveal")?
+            .randao_reveal(validator_pubkey, slot.epoch(E::slots_per_epoch()))
+            .await
+            .map_err(|e| format!("Unable to produce randao reveal signature: {:?}", e))?
             .into();
+
+        let graffiti = self
+            .graffiti_file
+            .clone()
+            .and_then(|mut g| match g.load_graffiti(&validator_pubkey) {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!(log, "Failed to read graffiti file"; "error" => ?e);
+                    None
+                }
+            })
+            .or_else(|| self.validator_store.graffiti(&validator_pubkey))
+            .or(self.graffiti);
 
         let randao_reveal_ref = &randao_reveal;
         let self_ref = &self;
@@ -232,17 +263,27 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockService<T, E> {
         let signed_block = self
             .beacon_nodes
             .first_success(RequireSynced::No, |beacon_node| async move {
+                let get_timer = metrics::start_timer_vec(
+                    &metrics::BLOCK_SERVICE_TIMES,
+                    &[metrics::BEACON_BLOCK_HTTP_GET],
+                );
                 let block = beacon_node
-                    .get_validator_blocks(slot, randao_reveal_ref, self_ref.graffiti.as_ref())
+                    .get_validator_blocks(slot, randao_reveal_ref, graffiti.as_ref())
                     .await
                     .map_err(|e| format!("Error from beacon node when producing block: {:?}", e))?
                     .data;
+                drop(get_timer);
 
                 let signed_block = self_ref
                     .validator_store
-                    .sign_block(validator_pubkey_ref, block, current_slot)
-                    .ok_or("Unable to sign block")?;
+                    .sign_block(*validator_pubkey_ref, block, current_slot)
+                    .await
+                    .map_err(|e| format!("Unable to sign block: {:?}", e))?;
 
+                let _post_timer = metrics::start_timer_vec(
+                    &metrics::BLOCK_SERVICE_TIMES,
+                    &[metrics::BEACON_BLOCK_HTTP_POST],
+                );
                 beacon_node
                     .post_beacon_blocks(&signed_block)
                     .await
@@ -258,8 +299,9 @@ impl<T: SlotClock + 'static, E: EthSpec> BlockService<T, E> {
         info!(
             log,
             "Successfully published block";
-            "deposits" => signed_block.message.body.deposits.len(),
-            "attestations" => signed_block.message.body.attestations.len(),
+            "deposits" => signed_block.message().body().deposits().len(),
+            "attestations" => signed_block.message().body().attestations().len(),
+            "graffiti" => ?graffiti.map(|g| g.as_utf8_lossy()),
             "slot" => signed_block.slot().as_u64(),
         );
 

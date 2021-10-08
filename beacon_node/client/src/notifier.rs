@@ -1,7 +1,6 @@
 use crate::metrics;
 use beacon_chain::{BeaconChain, BeaconChainTypes};
-use eth2_libp2p::NetworkGlobals;
-use futures::prelude::*;
+use eth2_libp2p::{types::SyncState, NetworkGlobals};
 use parking_lot::Mutex;
 use slog::{debug, error, info, warn, Logger};
 use slot_clock::SlotClock;
@@ -20,14 +19,17 @@ const MINUTES_PER_HOUR: i64 = 60;
 /// The number of historical observations that should be used to determine the average sync time.
 const SPEEDO_OBSERVATIONS: usize = 4;
 
+/// The number of slots between logs that give detail about backfill process.
+const BACKFILL_LOG_INTERVAL: u64 = 5;
+
 /// Spawns a notifier service which periodically logs information about the node.
 pub fn spawn_notifier<T: BeaconChainTypes>(
     executor: task_executor::TaskExecutor,
     beacon_chain: Arc<BeaconChain<T>>,
     network: Arc<NetworkGlobals<T::EthSpec>>,
-    milliseconds_per_slot: u64,
+    seconds_per_slot: u64,
 ) -> Result<(), String> {
-    let slot_duration = Duration::from_millis(milliseconds_per_slot);
+    let slot_duration = Duration::from_secs(seconds_per_slot);
     let duration_to_next_slot = beacon_chain
         .slot_clock
         .duration_to_next_slot()
@@ -42,6 +44,16 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
     let speedo = Mutex::new(Speedo::default());
     let log = executor.log().clone();
     let mut interval = tokio::time::interval_at(start_instant, interval_duration);
+
+    // Keep track of sync state and reset the speedo on specific sync state changes.
+    // Specifically, if we switch between a sync and a backfill sync, reset the speedo.
+    let mut current_sync_state = network.sync_state();
+
+    // Store info if we are required to do a backfill sync.
+    let original_anchor_slot = beacon_chain
+        .store
+        .get_anchor_info()
+        .map(|ai| ai.oldest_block_slot);
 
     let interval_future = async move {
         // Perform pre-genesis logging.
@@ -64,41 +76,98 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
         }
 
         // Perform post-genesis logging.
-        while interval.next().await.is_some() {
+        let mut last_backfill_log_slot = None;
+        loop {
+            interval.tick().await;
             let connected_peer_count = network.connected_peers();
             let sync_state = network.sync_state();
 
-            let head_info = beacon_chain.head_info().map_err(|e| {
-                error!(
-                    log,
-                    "Failed to get beacon chain head info";
-                    "error" => format!("{:?}", e)
-                )
-            })?;
+            // Determine if we have switched syncing chains
+            if sync_state != current_sync_state {
+                match (current_sync_state, &sync_state) {
+                    (_, SyncState::BackFillSyncing { .. }) => {
+                        // We have transitioned to a backfill sync. Reset the speedo.
+                        let mut speedo = speedo.lock();
+                        speedo.clear();
+                    }
+                    (SyncState::BackFillSyncing { .. }, _) => {
+                        // We have transitioned from a backfill sync, reset the speedo
+                        let mut speedo = speedo.lock();
+                        speedo.clear();
+                    }
+                    (_, _) => {}
+                }
+                current_sync_state = sync_state;
+            }
+
+            let head_info = match beacon_chain.head_info() {
+                Ok(head_info) => head_info,
+                Err(e) => {
+                    error!(log, "Failed to get beacon chain head info"; "error" => format!("{:?}", e));
+                    break;
+                }
+            };
 
             let head_slot = head_info.slot;
-            let current_slot = beacon_chain.slot().map_err(|e| {
-                error!(
-                    log,
-                    "Unable to read current slot";
-                    "error" => format!("{:?}", e)
-                )
-            })?;
+
+            metrics::set_gauge(&metrics::NOTIFIER_HEAD_SLOT, head_slot.as_u64() as i64);
+
+            let current_slot = match beacon_chain.slot() {
+                Ok(slot) => slot,
+                Err(e) => {
+                    error!(
+                        log,
+                        "Unable to read current slot";
+                        "error" => format!("{:?}", e)
+                    );
+                    break;
+                }
+            };
+
             let current_epoch = current_slot.epoch(T::EthSpec::slots_per_epoch());
             let finalized_epoch = head_info.finalized_checkpoint.epoch;
             let finalized_root = head_info.finalized_checkpoint.root;
             let head_root = head_info.block_root;
 
-            let mut speedo = speedo.lock();
-            speedo.observe(head_slot, Instant::now());
+            // The default is for regular sync but this gets modified if backfill sync is in
+            // progress.
+            let mut sync_distance = current_slot - head_slot;
 
+            let mut speedo = speedo.lock();
+            match current_sync_state {
+                SyncState::BackFillSyncing { .. } => {
+                    // Observe backfilling sync info.
+                    if let Some(oldest_slot) = original_anchor_slot {
+                        if let Some(current_anchor_slot) = beacon_chain
+                            .store
+                            .get_anchor_info()
+                            .map(|ai| ai.oldest_block_slot)
+                        {
+                            sync_distance = current_anchor_slot;
+                            speedo
+                                // For backfill sync use a fake slot which is the distance we've progressed from the starting `oldest_block_slot`.
+                                .observe(
+                                    oldest_slot.saturating_sub(current_anchor_slot),
+                                    Instant::now(),
+                                );
+                        }
+                    }
+                }
+                SyncState::SyncingFinalized { .. }
+                | SyncState::SyncingHead { .. }
+                | SyncState::SyncTransition => {
+                    speedo.observe(head_slot, Instant::now());
+                }
+                SyncState::Stalled | SyncState::Synced => {}
+            }
+
+            // NOTE: This is going to change based on which sync we are currently performing. A
+            // backfill sync should process slots significantly faster than the other sync
+            // processes.
             metrics::set_gauge(
                 &metrics::SYNC_SLOTS_PER_SECOND,
                 speedo.slots_per_second().unwrap_or(0_f64) as i64,
             );
-
-            // The next two lines take advantage of saturating subtraction on `Slot`.
-            let head_distance = current_slot - head_slot;
 
             if connected_peer_count <= WARN_PEER_COUNT {
                 warn!(log, "Low peer count"; "peer_count" => peer_count_pretty(connected_peer_count));
@@ -113,15 +182,57 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
                 "head_block" => format!("{}", head_root),
                 "head_slot" => head_slot,
                 "current_slot" => current_slot,
-                "sync_state" =>format!("{}", sync_state)
+                "sync_state" =>format!("{}", current_sync_state)
             );
 
-            // Log if we are syncing
-            if sync_state.is_syncing() {
+            // Log if we are backfilling.
+            let is_backfilling = matches!(current_sync_state, SyncState::BackFillSyncing { .. });
+            if is_backfilling
+                && last_backfill_log_slot
+                    .map_or(true, |slot| slot + BACKFILL_LOG_INTERVAL <= current_slot)
+            {
+                last_backfill_log_slot = Some(current_slot);
+
                 let distance = format!(
                     "{} slots ({})",
-                    head_distance.as_u64(),
-                    slot_distance_pretty(head_distance, slot_duration)
+                    sync_distance.as_u64(),
+                    slot_distance_pretty(sync_distance, slot_duration)
+                );
+
+                let speed = speedo.slots_per_second();
+                let display_speed = speed.map_or(false, |speed| speed != 0.0);
+
+                if display_speed {
+                    info!(
+                        log,
+                        "Downloading historical blocks";
+                        "distance" => distance,
+                        "speed" => sync_speed_pretty(speed),
+                        "est_time" => estimated_time_pretty(speedo.estimated_time_till_slot(original_anchor_slot.unwrap_or(current_slot))),
+                    );
+                } else {
+                    info!(
+                        log,
+                        "Downloading historical blocks";
+                        "distance" => distance,
+                        "est_time" => estimated_time_pretty(speedo.estimated_time_till_slot(original_anchor_slot.unwrap_or(current_slot))),
+                    );
+                }
+            } else if !is_backfilling && last_backfill_log_slot.is_some() {
+                last_backfill_log_slot = None;
+                info!(
+                    log,
+                    "Historical block download complete";
+                );
+            }
+
+            // Log if we are syncing
+            if current_sync_state.is_syncing() {
+                metrics::set_gauge(&metrics::IS_SYNCED, 0);
+                let distance = format!(
+                    "{} slots ({})",
+                    sync_distance.as_u64(),
+                    slot_distance_pretty(sync_distance, slot_duration)
                 );
 
                 let speed = speedo.slots_per_second();
@@ -145,7 +256,8 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
                         "est_time" => estimated_time_pretty(speedo.estimated_time_till_slot(current_slot)),
                     );
                 }
-            } else if sync_state.is_synced() {
+            } else if current_sync_state.is_synced() {
+                metrics::set_gauge(&metrics::IS_SYNCED, 1);
                 let block_info = if current_slot > head_slot {
                     "   …  empty".to_string()
                 } else {
@@ -162,6 +274,7 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
                     "slot" => current_slot,
                 );
             } else {
+                metrics::set_gauge(&metrics::IS_SYNCED, 0);
                 info!(
                     log,
                     "Searching for peers";
@@ -175,11 +288,10 @@ pub fn spawn_notifier<T: BeaconChainTypes>(
 
             eth1_logging(&beacon_chain, &log);
         }
-        Ok::<(), ()>(())
     };
 
     // run the notifier on the current executor
-    executor.spawn(interval_future.unwrap_or_else(|_| ()), "notifier");
+    executor.spawn(interval_future, "notifier");
 
     Ok(())
 }
@@ -218,7 +330,6 @@ fn eth1_logging<T: BeaconChainTypes>(beacon_chain: &BeaconChain<T>, log: &Logger
                     warn!(
                         log,
                         "Syncing eth1 block cache";
-                        "msg" => "sync can take longer when using remote eth1 nodes",
                         "est_blocks_remaining" => distance,
                     );
                 }
@@ -387,5 +498,10 @@ impl Speedo {
         } else {
             None
         }
+    }
+
+    /// Clears all past observations to be used for an alternative sync (i.e backfill sync).
+    pub fn clear(&mut self) {
+        self.0.clear()
     }
 }

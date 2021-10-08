@@ -35,14 +35,13 @@ mod tests {
     fn test_dht_persistence() {
         let log = get_logger(false);
 
-        let beacon_chain = Arc::new(
-            BeaconChainHarness::new_with_store_config(
-                MinimalEthSpec,
-                generate_deterministic_keypairs(8),
-                StoreConfig::default(),
-            )
-            .chain,
-        );
+        let beacon_chain = BeaconChainHarness::new_with_store_config(
+            MinimalEthSpec,
+            None,
+            generate_deterministic_keypairs(8),
+            StoreConfig::default(),
+        )
+        .chain;
 
         let store = beacon_chain.store.clone();
 
@@ -70,11 +69,9 @@ mod tests {
             // Create a new network service which implicitly gets dropped at the
             // end of the block.
 
-            let _ = NetworkService::start(beacon_chain.clone(), &config, executor)
+            let _network_service = NetworkService::start(beacon_chain.clone(), &config, executor)
                 .await
                 .unwrap();
-            // Allow the network task to spawn on the executor before shutting down.
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             drop(signal);
         });
 

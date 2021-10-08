@@ -1,9 +1,11 @@
+use crate::attester_cache::Error as AttesterCacheError;
 use crate::beacon_chain::ForkChoiceError;
 use crate::beacon_fork_choice_store::Error as ForkChoiceStoreError;
 use crate::eth1_chain::Error as Eth1ChainError;
+use crate::historical_blocks::HistoricalBlockError;
 use crate::migrate::PruningError;
 use crate::naive_aggregation_pool::Error as NaiveAggregationError;
-use crate::observed_attestations::Error as ObservedAttestationsError;
+use crate::observed_aggregates::Error as ObservedAttestationsError;
 use crate::observed_attesters::Error as ObservedAttestersError;
 use crate::observed_block_producers::Error as ObservedBlockProducersError;
 use futures::channel::mpsc::TrySendError;
@@ -14,12 +16,14 @@ use state_processing::{
     block_signature_verifier::Error as BlockSignatureVerifierError,
     per_block_processing::errors::{
         AttestationValidationError, AttesterSlashingValidationError, ExitValidationError,
-        ProposerSlashingValidationError,
+        ProposerSlashingValidationError, SyncCommitteeMessageValidationError,
     },
     signature_sets::Error as SignatureSetError,
+    state_advance::Error as StateAdvanceError,
     BlockProcessingError, SlotProcessingError,
 };
 use std::time::Duration;
+use task_executor::ShutdownReason;
 use types::*;
 
 macro_rules! easy_from_to {
@@ -51,12 +55,14 @@ pub enum BeaconChainError {
     MissingBeaconBlock(Hash256),
     MissingBeaconState(Hash256),
     SlotProcessingError(SlotProcessingError),
+    StateAdvanceError(StateAdvanceError),
     UnableToAdvanceState(String),
     NoStateForAttestation {
         beacon_block_root: Hash256,
     },
     CannotAttestToFutureState,
     AttestationValidationError(AttestationValidationError),
+    SyncCommitteeMessageValidationError(SyncCommitteeMessageValidationError),
     ExitValidationError(ExitValidationError),
     ProposerSlashingValidationError(ProposerSlashingValidationError),
     AttesterSlashingValidationError(AttesterSlashingValidationError),
@@ -69,9 +75,11 @@ pub enum BeaconChainError {
     /// Returned when an internal check fails, indicating corrupt data.
     InvariantViolated(String),
     SszTypesError(SszTypesError),
+    NoProposerForSlot(Slot),
     CanonicalHeadLockTimeout,
     AttestationCacheLockTimeout,
     ValidatorPubkeyCacheLockTimeout,
+    SnapshotCacheLockTimeout,
     IncorrectStateForAttestation(RelativeEpochError),
     InvalidValidatorPubkeyBytes(bls::Error),
     ValidatorPubkeyCacheIncomplete(usize),
@@ -79,11 +87,14 @@ pub enum BeaconChainError {
     BlockSignatureVerifierError(state_processing::block_signature_verifier::Error),
     DuplicateValidatorPublicKey,
     ValidatorPubkeyCacheFileError(String),
+    ValidatorIndexUnknown(usize),
+    ValidatorPubkeyUnknown(PublicKeyBytes),
     OpPoolError(OpPoolError),
     NaiveAggregationError(NaiveAggregationError),
     ObservedAttestationsError(ObservedAttestationsError),
     ObservedAttestersError(ObservedAttestersError),
     ObservedBlockProducersError(ObservedBlockProducersError),
+    AttesterCacheError(AttesterCacheError),
     PruningError(PruningError),
     ArithError(ArithError),
     InvalidShufflingId {
@@ -91,11 +102,42 @@ pub enum BeaconChainError {
         head_block_epoch: Epoch,
     },
     WeakSubjectivtyVerificationFailure,
-    WeakSubjectivtyShutdownError(TrySendError<&'static str>),
+    WeakSubjectivtyShutdownError(TrySendError<ShutdownReason>),
+    AttestingToFinalizedSlot {
+        finalized_slot: Slot,
+        request_slot: Slot,
+    },
+    AttestingToAncientSlot {
+        lowest_permissible_slot: Slot,
+        request_slot: Slot,
+    },
+    BadPreState {
+        parent_root: Hash256,
+        parent_slot: Slot,
+        block_root: Hash256,
+        block_slot: Slot,
+        state_slot: Slot,
+    },
+    HistoricalBlockError(HistoricalBlockError),
+    InvalidStateForShuffling {
+        state_epoch: Epoch,
+        shuffling_epoch: Epoch,
+    },
+    SyncDutiesError(BeaconStateError),
+    InconsistentForwardsIter {
+        request_slot: Slot,
+        slot: Slot,
+    },
+    InvalidReorgSlotIter {
+        old_slot: Slot,
+        new_slot: Slot,
+    },
+    AltairForkDisabled,
 }
 
 easy_from_to!(SlotProcessingError, BeaconChainError);
 easy_from_to!(AttestationValidationError, BeaconChainError);
+easy_from_to!(SyncCommitteeMessageValidationError, BeaconChainError);
 easy_from_to!(ExitValidationError, BeaconChainError);
 easy_from_to!(ProposerSlashingValidationError, BeaconChainError);
 easy_from_to!(AttesterSlashingValidationError, BeaconChainError);
@@ -105,10 +147,13 @@ easy_from_to!(NaiveAggregationError, BeaconChainError);
 easy_from_to!(ObservedAttestationsError, BeaconChainError);
 easy_from_to!(ObservedAttestersError, BeaconChainError);
 easy_from_to!(ObservedBlockProducersError, BeaconChainError);
+easy_from_to!(AttesterCacheError, BeaconChainError);
 easy_from_to!(BlockSignatureVerifierError, BeaconChainError);
 easy_from_to!(PruningError, BeaconChainError);
 easy_from_to!(ArithError, BeaconChainError);
 easy_from_to!(ForkChoiceStoreError, BeaconChainError);
+easy_from_to!(HistoricalBlockError, BeaconChainError);
+easy_from_to!(StateAdvanceError, BeaconChainError);
 
 #[derive(Debug)]
 pub enum BlockProductionError {
@@ -120,13 +165,19 @@ pub enum BlockProductionError {
     BlockProcessingError(BlockProcessingError),
     Eth1ChainError(Eth1ChainError),
     BeaconStateError(BeaconStateError),
+    StateAdvanceError(StateAdvanceError),
     OpPoolError(OpPoolError),
     /// The `BeaconChain` was explicitly configured _without_ a connection to eth1, therefore it
     /// cannot produce blocks.
     NoEth1ChainConnection,
+    StateSlotTooHigh {
+        produce_at_slot: Slot,
+        state_slot: Slot,
+    },
 }
 
 easy_from_to!(BlockProcessingError, BlockProductionError);
 easy_from_to!(BeaconStateError, BlockProductionError);
 easy_from_to!(SlotProcessingError, BlockProductionError);
 easy_from_to!(Eth1ChainError, BlockProductionError);
+easy_from_to!(StateAdvanceError, BlockProductionError);

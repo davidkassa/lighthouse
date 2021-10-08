@@ -7,7 +7,8 @@
 - [How do I update lighthouse?](#how-do-i-update-lighthouse)
 - [I can't compile lighthouse](#i-cant-compile-lighthouse)
 - [What is "Syncing eth1 block cache"](#what-is-syncing-eth1-block-cache)
-
+- [Can I use redundancy in my staking setup?](#can-i-use-redundancy-in-my-staking-setup)
+- [How can I monitor my validators](#how-can-i-monitor-my-validators)
 
 ### Why does it take so long for a validator to be activated?
 
@@ -160,7 +161,7 @@ See [here.](./installation-source.md#troubleshooting)
 ### What is "Syncing eth1 block cache"
 
 ```
-Nov 30 21:04:28.268 WARN Syncing eth1 block cache   est_blocks_remaining: initializing deposits, msg: sync can take longer when using remote eth1 nodes, service: slot_notifier
+Nov 30 21:04:28.268 WARN Syncing eth1 block cache   est_blocks_remaining: initializing deposits, service: slot_notifier
 ```
 
 This log indicates that your beacon node is downloading blocks and deposits
@@ -174,3 +175,17 @@ or after being off for more than several minutes.
 
 If this log continues appearing sporadically during operation, there may be an
 issue with your eth1 endpoint.
+
+### Can I use redundancy in my staking setup?
+
+You should **never** use duplicate/redundant validator keypairs or validator clients (i.e., don't
+duplicate your JSON keystores and don't run `lighthouse vc` twice). This will lead to slashing.
+
+However, there are some components which can be configured with redundancy. See the
+[Redundancy](./redundancy.md) guide for more information.
+
+### How can I monitor my validators?
+
+Apart from using block explorers, you may use the "Validator Monitor" built into Lighthouse which
+provides logging and Prometheus/Grafana metrics for individual validators. See [Validator
+Monitoring](./validator-monitoring.md) for more information.

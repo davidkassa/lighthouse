@@ -120,9 +120,9 @@ impl<T, N: Unsigned> From<Vec<T>> for VariableList<T, N> {
     }
 }
 
-impl<T, N: Unsigned> Into<Vec<T>> for VariableList<T, N> {
-    fn into(self) -> Vec<T> {
-        self.vec
+impl<T, N: Unsigned> From<VariableList<T, N>> for Vec<T> {
+    fn from(list: VariableList<T, N>) -> Vec<T> {
+        list.vec
     }
 }
 
@@ -345,7 +345,7 @@ mod test {
     fn round_trip<T: Encode + Decode + std::fmt::Debug + PartialEq>(item: T) {
         let encoded = &item.as_ssz_bytes();
         assert_eq!(item.ssz_bytes_len(), encoded.len());
-        assert_eq!(T::from_ssz_bytes(&encoded), Ok(item));
+        assert_eq!(T::from_ssz_bytes(encoded), Ok(item));
     }
 
     #[test]

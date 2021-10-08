@@ -1,7 +1,6 @@
 use parking_lot::RwLock;
 use ssz_derive::{Decode, Encode};
 use std::collections::HashMap;
-use std::iter::FromIterator;
 use types::{Hash256, Slot};
 
 #[derive(Debug, PartialEq)]
@@ -61,13 +60,12 @@ impl HeadTracker {
                 slots_len,
             })
         } else {
-            let map = HashMap::from_iter(
-                ssz_container
-                    .roots
-                    .iter()
-                    .zip(ssz_container.slots.iter())
-                    .map(|(root, slot)| (*root, *slot)),
-            );
+            let map = ssz_container
+                .roots
+                .iter()
+                .zip(ssz_container.slots.iter())
+                .map(|(root, slot)| (*root, *slot))
+                .collect::<HashMap<_, _>>();
 
             Ok(Self(RwLock::new(map)))
         }
@@ -114,14 +112,14 @@ mod test {
             let mut block: BeaconBlock<E> = BeaconBlock::empty(spec);
             let block_root = Hash256::from_low_u64_be(i);
 
-            block.slot = Slot::new(i);
-            block.parent_root = if i == 0 {
+            *block.slot_mut() = Slot::new(i);
+            *block.parent_root_mut() = if i == 0 {
                 Hash256::random()
             } else {
                 Hash256::from_low_u64_be(i - 1)
             };
 
-            head_tracker.register_block(block_root, block.parent_root, block.slot);
+            head_tracker.register_block(block_root, block.parent_root(), block.slot());
         }
 
         assert_eq!(
@@ -132,9 +130,9 @@ mod test {
 
         let mut block: BeaconBlock<E> = BeaconBlock::empty(spec);
         let block_root = Hash256::from_low_u64_be(42);
-        block.slot = Slot::new(15);
-        block.parent_root = Hash256::from_low_u64_be(14);
-        head_tracker.register_block(block_root, block.parent_root, block.slot);
+        *block.slot_mut() = Slot::new(15);
+        *block.parent_root_mut() = Hash256::from_low_u64_be(14);
+        head_tracker.register_block(block_root, block.parent_root(), block.slot());
 
         let heads = head_tracker.heads();
 

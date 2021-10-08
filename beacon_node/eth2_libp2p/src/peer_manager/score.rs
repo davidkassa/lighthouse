@@ -5,9 +5,10 @@
 //! As the logic develops this documentation will advance.
 //!
 //! The scoring algorithms are currently experimental.
-use crate::behaviour::GOSSIPSUB_GREYLIST_THRESHOLD;
+use crate::behaviour::gossipsub_scoring_parameters::GREYLIST_THRESHOLD as GOSSIPSUB_GREYLIST_THRESHOLD;
 use serde::Serialize;
 use std::time::Instant;
+use strum::AsRefStr;
 use tokio::time::Duration;
 
 lazy_static! {
@@ -30,7 +31,7 @@ const MIN_SCORE: f64 = -100.0;
 /// The halflife of a peer's score. I.e the number of seconds it takes for the score to decay to half its value.
 const SCORE_HALFLIFE: f64 = 600.0;
 /// The number of seconds we ban a peer for before their score begins to decay.
-const BANNED_BEFORE_DECAY: Duration = Duration::from_secs(1800);
+const BANNED_BEFORE_DECAY: Duration = Duration::from_secs(12 * 3600); // 12 hours
 
 /// We weight negative gossipsub scores in such a way that they never result in a disconnect by
 /// themselves. This "solves" the problem of non-decaying gossipsub scores for disconnected peers.
@@ -42,7 +43,8 @@ const GOSSIPSUB_POSITIVE_SCORE_WEIGHT: f64 = GOSSIPSUB_NEGATIVE_SCORE_WEIGHT;
 /// Each variant has an associated score change.
 // To easily assess the behaviour of scores changes the number of variants should stay low, and
 // somewhat generic.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, AsRefStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum PeerAction {
     /// We should not communicate more with this peer.
     /// This action will cause the peer to get banned.
@@ -70,6 +72,7 @@ pub enum ReportSource {
     RPC,
     Processor,
     SyncService,
+    PeerManager,
 }
 
 impl From<ReportSource> for &'static str {
@@ -79,6 +82,7 @@ impl From<ReportSource> for &'static str {
             ReportSource::RPC => "rpc_error",
             ReportSource::Processor => "processor",
             ReportSource::SyncService => "sync",
+            ReportSource::PeerManager => "peer_manager",
         }
     }
 }
@@ -90,17 +94,6 @@ impl std::fmt::Display for PeerAction {
             PeerAction::LowToleranceError => write!(f, "Low Tolerance Error"),
             PeerAction::MidToleranceError => write!(f, "Mid Tolerance Error"),
             PeerAction::HighToleranceError => write!(f, "High Tolerance Error"),
-        }
-    }
-}
-
-impl PeerAction {
-    pub fn as_static_str(&self) -> &'static str {
-        match self {
-            PeerAction::HighToleranceError => "high_tolerance",
-            PeerAction::MidToleranceError => "mid_tolerance",
-            PeerAction::LowToleranceError => "low_tolerance",
-            PeerAction::Fatal => "fatal",
         }
     }
 }
@@ -225,6 +218,13 @@ impl RealScore {
         self.set_lighthouse_score(0f64);
     }
 
+    // Set the gossipsub_score to a specific f64.
+    // Used in testing to induce score status changes during a heartbeat.
+    #[cfg(test)]
+    pub fn set_gossipsub_score(&mut self, score: f64) {
+        self.gossipsub_score = score;
+    }
+
     /// Applies time-based logic such as decay rates to the score.
     /// This function should be called periodically.
     pub fn update(&mut self) {
@@ -300,6 +300,8 @@ apply!(update_gossipsub_score, new_score: f64, ignore: bool);
 apply!(test_add, score: f64);
 #[cfg(test)]
 apply!(test_reset);
+#[cfg(test)]
+apply!(set_gossipsub_score, score: f64);
 
 impl Score {
     pub fn score(&self) -> f64 {
@@ -355,6 +357,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_reputation_change() {
         let mut score = Score::default();
 
@@ -384,6 +387,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_ban_time() {
         let mut score = RealScore::default();
         let now = Instant::now();
@@ -411,6 +415,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_ignored_gossipsub_score() {
         let mut score = Score::default();
         score.update_gossipsub_score(GOSSIPSUB_GREYLIST_THRESHOLD, true);

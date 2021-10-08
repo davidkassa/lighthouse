@@ -2,7 +2,7 @@ use crate::beacon_processor::worker::FUTURE_SLOT_TOLERANCE;
 use crate::service::NetworkMessage;
 use crate::status::ToStatusMessage;
 use crate::sync::SyncMessage;
-use beacon_chain::{BeaconChainError, BeaconChainTypes};
+use beacon_chain::{BeaconChainError, BeaconChainTypes, HistoricalBlockError, WhenSlotSkipped};
 use eth2_libp2p::rpc::StatusMessage;
 use eth2_libp2p::rpc::*;
 use eth2_libp2p::{PeerId, PeerRequestId, ReportSource, Response, SyncInfo};
@@ -35,6 +35,21 @@ impl<T: BeaconChainTypes> Worker<T> {
             peer_id,
             id,
             response,
+        })
+    }
+
+    pub fn send_error_response(
+        &self,
+        peer_id: PeerId,
+        error: RPCResponseErrorCode,
+        reason: String,
+        id: PeerRequestId,
+    ) {
+        self.send_network_message(NetworkMessage::SendErrorResponse {
+            peer_id,
+            error,
+            reason,
+            id,
         })
     }
 
@@ -72,7 +87,7 @@ impl<T: BeaconChainTypes> Worker<T> {
             && local.finalized_root != Hash256::zero()
             && self
                 .chain
-                .root_at_slot(start_slot(remote.finalized_epoch))
+                .block_root_at_slot(start_slot(remote.finalized_epoch), WhenSlotSkipped::Prev)
                 .map(|root_opt| root_opt != Some(remote.finalized_root))?
         {
             // The remote's finalized epoch is less than or equal to ours, but the block root is
@@ -163,6 +178,20 @@ impl<T: BeaconChainTypes> Worker<T> {
             .forwards_iter_block_roots(Slot::from(req.start_slot))
         {
             Ok(iter) => iter,
+            Err(BeaconChainError::HistoricalBlockError(
+                HistoricalBlockError::BlockOutOfRange {
+                    slot,
+                    oldest_block_slot,
+                },
+            )) => {
+                debug!(self.log, "Range request failed during backfill"; "requested_slot" => slot, "oldest_known_slot" => oldest_block_slot);
+                return self.send_error_response(
+                    peer_id,
+                    RPCResponseErrorCode::ResourceUnavailable,
+                    "Backfilling".into(),
+                    request_id,
+                );
+            }
             Err(e) => return error!(self.log, "Unable to obtain root iter"; "error" => ?e),
         };
 
@@ -197,10 +226,7 @@ impl<T: BeaconChainTypes> Worker<T> {
         };
 
         // remove all skip slots
-        let block_roots = block_roots
-            .into_iter()
-            .filter_map(|root| root)
-            .collect::<Vec<_>>();
+        let block_roots = block_roots.into_iter().flatten().collect::<Vec<_>>();
 
         let mut blocks_sent = 0;
         for root in block_roots {

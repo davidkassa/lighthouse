@@ -77,7 +77,7 @@ fn process_pubkey_bytes_field(
 
 fn process_slice_field(new_tree_hash: &[u8], leaf: &mut Hash256, force_update: bool) -> bool {
     if force_update || leaf.as_bytes() != new_tree_hash {
-        leaf.assign_from_slice(&new_tree_hash);
+        leaf.assign_from_slice(new_tree_hash);
         true
     } else {
         false
@@ -137,9 +137,11 @@ mod test {
 
     #[test]
     fn zeroed_validator() {
-        let mut v = Validator::default();
-        v.activation_eligibility_epoch = Epoch::from(0u64);
-        v.activation_epoch = Epoch::from(0u64);
+        let v = Validator {
+            activation_eligibility_epoch: Epoch::from(0u64),
+            activation_epoch: Epoch::from(0u64),
+            ..Default::default()
+        };
         test_validator_tree_hash(&v);
     }
 
@@ -153,6 +155,7 @@ mod test {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     pub fn smallvec_size_check() {
         // If this test fails we need to go and reassess the length of the `SmallVec` in
         // `cached_tree_hash::TreeHashCache`. If the size of the `SmallVec` is too slow we're going

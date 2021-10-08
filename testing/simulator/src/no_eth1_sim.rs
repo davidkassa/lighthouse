@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use std::cmp::max;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::{sleep_until, Instant};
+use tokio::time::sleep;
 use types::{Epoch, EthSpec, MainnetEthSpec};
 
 pub fn run_no_eth1_sim(matches: &ArgMatches) -> Result<(), String> {
@@ -55,9 +55,8 @@ pub fn run_no_eth1_sim(matches: &ArgMatches) -> Result<(), String> {
 
     let total_validator_count = validators_per_node * node_count;
 
-    spec.milliseconds_per_slot /= speed_up_factor;
-    //currently lighthouse only supports slot lengths that are multiples of seconds
-    spec.milliseconds_per_slot = max(1000, spec.milliseconds_per_slot / 1000 * 1000);
+    spec.seconds_per_slot /= speed_up_factor;
+    spec.seconds_per_slot = max(1, spec.seconds_per_slot);
     spec.eth1_follow_distance = 16;
     spec.genesis_delay = eth1_block_time.as_secs() * spec.eth1_follow_distance * 2;
     spec.min_genesis_time = 0;
@@ -69,9 +68,8 @@ pub fn run_no_eth1_sim(matches: &ArgMatches) -> Result<(), String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "should get system time")?
         + genesis_delay;
-    let genesis_instant = Instant::now() + genesis_delay;
 
-    let slot_duration = Duration::from_millis(spec.milliseconds_per_slot);
+    let slot_duration = Duration::from_secs(spec.seconds_per_slot);
 
     let context = env.core_context();
 
@@ -87,7 +85,7 @@ pub fn run_no_eth1_sim(matches: &ArgMatches) -> Result<(), String> {
     beacon_config.network.enr_address = Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
     let main_future = async {
-        let network = LocalNetwork::new(context, beacon_config.clone()).await?;
+        let network = LocalNetwork::new(context.clone(), beacon_config.clone()).await?;
         /*
          * One by one, add beacon nodes to the network.
          */
@@ -98,44 +96,39 @@ pub fn run_no_eth1_sim(matches: &ArgMatches) -> Result<(), String> {
 
         /*
          * Create a future that will add validator clients to the network. Each validator client is
-         * attached to a single corresponding beacon node.
+         * attached to a single corresponding beacon node. Spawn each validator in a new task.
          */
-        let add_validators_fut = async {
-            for (i, files) in validator_files.into_iter().enumerate() {
-                network
-                    .add_validator_client(testing_validator_config(), i, files, i % 2 == 0)
-                    .await?;
-            }
-
-            Ok::<(), String>(())
-        };
-
-        /*
-         * The processes that will run checks on the network as it runs.
-         */
-        let checks_fut = async {
-            sleep_until(genesis_instant).await;
-
-            let (finalization, block_prod) = futures::join!(
-                // Check that the chain finalizes at the first given opportunity.
-                checks::verify_first_finalization(network.clone(), slot_duration),
-                // Check that a block is produced at every slot.
-                checks::verify_full_block_production_up_to(
-                    network.clone(),
-                    Epoch::new(4).start_slot(MainnetEthSpec::slots_per_epoch()),
-                    slot_duration,
-                )
+        let executor = context.executor.clone();
+        for (i, files) in validator_files.into_iter().enumerate() {
+            let network_1 = network.clone();
+            executor.spawn(
+                async move {
+                    println!("Adding validator client {}", i);
+                    network_1
+                        .add_validator_client(testing_validator_config(), i, files, i % 2 == 0)
+                        .await
+                        .expect("should add validator");
+                },
+                "vc",
             );
-            finalization?;
-            block_prod?;
+        }
 
-            Ok::<(), String>(())
-        };
+        let duration_to_genesis = network.duration_to_genesis().await;
+        println!("Duration to genesis: {}", duration_to_genesis.as_secs());
+        sleep(duration_to_genesis).await;
 
-        let (add_validators, start_checks) = futures::join!(add_validators_fut, checks_fut);
-
-        add_validators?;
-        start_checks?;
+        let (finalization, block_prod) = futures::join!(
+            // Check that the chain finalizes at the first given opportunity.
+            checks::verify_first_finalization(network.clone(), slot_duration),
+            // Check that a block is produced at every slot.
+            checks::verify_full_block_production_up_to(
+                network.clone(),
+                Epoch::new(4).start_slot(MainnetEthSpec::slots_per_epoch()),
+                slot_duration,
+            ),
+        );
+        finalization?;
+        block_prod?;
 
         // The `final_future` either completes immediately or never completes, depending on the value
         // of `continue_after_checks`.
@@ -159,9 +152,7 @@ pub fn run_no_eth1_sim(matches: &ArgMatches) -> Result<(), String> {
         Ok::<(), String>(())
     };
 
-    env.runtime()
-        .block_on(tokio_compat_02::FutureExt::compat(main_future))
-        .unwrap();
+    env.runtime().block_on(main_future).unwrap();
 
     env.fire_signal();
     env.shutdown_on_idle();

@@ -11,10 +11,10 @@
 //! may lead to programming errors which are not detected by the compiler.
 
 use crate::test_utils::TestRandom;
-use crate::SignedRoot;
+use crate::{ChainSpec, SignedRoot};
 
 use rand::RngCore;
-use safe_arith::SafeArith;
+use safe_arith::{ArithError, SafeArith};
 use serde_derive::{Deserialize, Serialize};
 use ssz::{ssz_encode, Decode, DecodeError, Encode};
 use std::fmt;
@@ -27,12 +27,12 @@ use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Rem, Sub, SubAssi
 #[cfg_attr(feature = "arbitrary-fuzz", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Slot(#[serde(with = "serde_utils::quoted_u64")] u64);
+pub struct Slot(#[serde(with = "eth2_serde_utils::quoted_u64")] u64);
 
 #[cfg_attr(feature = "arbitrary-fuzz", derive(arbitrary::Arbitrary))]
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Epoch(#[serde(with = "serde_utils::quoted_u64")] u64);
+pub struct Epoch(#[serde(with = "eth2_serde_utils::quoted_u64")] u64);
 
 impl_common!(Slot);
 impl_common!(Epoch);
@@ -71,9 +71,8 @@ impl Epoch {
     pub fn end_slot(self, slots_per_epoch: u64) -> Slot {
         Slot::from(
             self.0
-                .saturating_add(1)
                 .saturating_mul(slots_per_epoch)
-                .saturating_sub(1),
+                .saturating_add(slots_per_epoch.saturating_sub(1)),
         )
     }
 
@@ -89,6 +88,13 @@ impl Epoch {
         } else {
             None
         }
+    }
+
+    /// Compute the sync committee period for an epoch.
+    pub fn sync_committee_period(&self, spec: &ChainSpec) -> Result<u64, ArithError> {
+        Ok(self
+            .safe_div(spec.epochs_per_sync_committee_period)?
+            .as_u64())
     }
 
     pub fn slot_iter(&self, slots_per_epoch: u64) -> SlotIter {
@@ -142,6 +148,17 @@ mod epoch_tests {
 
         assert_eq!(epoch.start_slot(slots_per_epoch), Slot::new(0));
         assert_eq!(epoch.end_slot(slots_per_epoch), Slot::new(7));
+    }
+
+    #[test]
+    fn end_slot_boundary_test() {
+        let slots_per_epoch = 32;
+
+        // The last epoch which can be represented by u64.
+        let epoch = Epoch::new(u64::max_value() / slots_per_epoch);
+
+        // A slot number on the epoch should be equal to u64::max_value.
+        assert_eq!(epoch.end_slot(slots_per_epoch), Slot::new(u64::max_value()));
     }
 
     #[test]

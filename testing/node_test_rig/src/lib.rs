@@ -4,14 +4,12 @@
 
 use beacon_node::ProductionBeaconNode;
 use environment::RuntimeContext;
-use eth2::{
-    reqwest::{ClientBuilder, Url},
-    BeaconNodeHttpClient,
-};
+use eth2::{reqwest::ClientBuilder, BeaconNodeHttpClient, Timeouts};
+use sensitive_url::SensitiveUrl;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tempdir::TempDir;
+use tempfile::{Builder as TempBuilder, TempDir};
 use types::EthSpec;
 use validator_client::ProductionValidatorClient;
 use validator_dir::insecure_keys::build_deterministic_validator_dirs;
@@ -42,7 +40,9 @@ impl<E: EthSpec> LocalBeaconNode<E> {
         mut client_config: ClientConfig,
     ) -> Result<Self, String> {
         // Creates a temporary directory that will be deleted once this `TempDir` is dropped.
-        let datadir = TempDir::new("lighthouse_node_test_rig")
+        let datadir = TempBuilder::new()
+            .prefix("lighthouse_node_test_rig")
+            .tempdir()
             .expect("should create temp directory for client datadir");
 
         client_config.data_dir = datadir.path().into();
@@ -66,9 +66,10 @@ impl<E: EthSpec> LocalBeaconNode<E> {
             .http_api_listen_addr()
             .ok_or("A remote beacon node must have a http server")?;
 
-        let beacon_node_url: Url = format!("http://{}:{}", listen_addr.ip(), listen_addr.port())
-            .parse()
-            .map_err(|e| format!("Unable to parse beacon node URL: {:?}", e))?;
+        let beacon_node_url: SensitiveUrl = SensitiveUrl::parse(
+            format!("http://{}:{}", listen_addr.ip(), listen_addr.port()).as_str(),
+        )
+        .map_err(|e| format!("Unable to parse beacon node URL: {:?}", e))?;
         let beacon_node_http_client = ClientBuilder::new()
             .timeout(HTTP_TIMEOUT)
             .build()
@@ -76,6 +77,7 @@ impl<E: EthSpec> LocalBeaconNode<E> {
         Ok(BeaconNodeHttpClient::from_components(
             beacon_node_url,
             beacon_node_http_client,
+            Timeouts::set_all(HTTP_TIMEOUT),
         ))
     }
 }
@@ -125,10 +127,14 @@ pub struct ValidatorFiles {
 impl ValidatorFiles {
     /// Creates temporary data and secrets dirs.
     pub fn new() -> Result<Self, String> {
-        let datadir = TempDir::new("lighthouse-validator-client")
+        let datadir = TempBuilder::new()
+            .prefix("lighthouse-validator-client")
+            .tempdir()
             .map_err(|e| format!("Unable to create VC data dir: {:?}", e))?;
 
-        let secrets_dir = TempDir::new("lighthouse-validator-client-secrets")
+        let secrets_dir = TempBuilder::new()
+            .prefix("lighthouse-validator-client-secrets")
+            .tempdir()
             .map_err(|e| format!("Unable to create VC secrets dir: {:?}", e))?;
 
         Ok(Self {

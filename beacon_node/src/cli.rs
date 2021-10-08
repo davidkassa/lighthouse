@@ -46,6 +46,19 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                 .takes_value(false),
         )
         .arg(
+            Arg::with_name("disable-packet-filter")
+                .long("disable-packet-filter")
+                .help("Disables the discovery packet filter. Useful for testing in smaller networks")
+                .takes_value(false),
+        )
+        .arg(
+            Arg::with_name("shutdown-after-sync")
+                .long("shutdown-after-sync")
+                .help("Shutdown beacon node as soon as sync is completed. Backfill sync will \
+                       not be performed before shutdown.")
+                .takes_value(false),
+        )
+        .arg(
             Arg::with_name("zero-ports")
                 .long("zero-ports")
                 .short("z")
@@ -142,8 +155,7 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                 .short("x")
                 .long("disable-enr-auto-update")
                 .help("Discovery automatically updates the nodes local ENR with an external IP address and port as seen by other peers on the network. \
-                This disables this feature, fixing the ENR's IP/PORT to those specified on boot.")
-                .takes_value(true),
+                This disables this feature, fixing the ENR's IP/PORT to those specified on boot."),
         )
         .arg(
             Arg::with_name("libp2p-addresses")
@@ -199,6 +211,12 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                     address of this server (e.g., http://localhost:5052).")
                 .takes_value(true),
         )
+        .arg(
+            Arg::with_name("http-disable-legacy-spec")
+                .long("http-disable-legacy-spec")
+                .help("Disable serving of legacy data on the /config/spec endpoint. May be \
+                       disabled by default in a future release.")
+        )
         /* Prometheus metrics HTTP server related arguments */
         .arg(
             Arg::with_name("metrics")
@@ -230,6 +248,23 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                     Use * to allow any origin (not recommended in production). \
                     If no value is supplied, the CORS allowed origin is set to the listen \
                     address of this server (e.g., http://localhost:5054).")
+                .takes_value(true),
+        )
+
+        /*
+         * Monitoring metrics
+         */
+
+        .arg(
+            Arg::with_name("monitoring-endpoint")
+                .long("monitoring-endpoint")
+                .value_name("ADDRESS")
+                .help("Enables the monitoring service for sending system metrics to a remote endpoint. \
+                This can be used to monitor your setup on certain services (e.g. beaconcha.in). \
+                This flag sets the endpoint where the beacon node metrics will be sent. \
+                Note: This will send information to a remote sever which may identify and associate your \
+                validators, IP address and other personal information. Always use a HTTPS connection \
+                and never provide an untrusted URL.")
                 .takes_value(true),
         )
 
@@ -445,10 +480,69 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
             Arg::with_name("wss-checkpoint")
                 .long("wss-checkpoint")
                 .help(
-                    "Used to input a Weak Subjectivity State Checkpoint in `block_root:epoch_number` format,\
-                     where block_root is an '0x' prefixed 32-byte hex string and epoch_number is an integer."
+                    "Specify a weak subjectivity checkpoint in `block_root:epoch` format to verify \
+                     the node's sync against. The block root should be 0x-prefixed. Note that this \
+                     flag is for verification only, to perform a checkpoint sync from a recent \
+                     state use --checkpoint-sync-url."
                 )
                 .value_name("WSS_CHECKPOINT")
+                .takes_value(true)
+        )
+        .arg(
+            Arg::with_name("checkpoint-state")
+                .long("checkpoint-state")
+                .help("Set a checkpoint state to start syncing from. Must be aligned and match \
+                       --checkpoint-block. Using --checkpoint-sync-url instead is recommended.")
+                .value_name("STATE_SSZ")
+                .takes_value(true)
+                .requires("checkpoint-block")
+        )
+        .arg(
+            Arg::with_name("checkpoint-block")
+                .long("checkpoint-block")
+                .help("Set a checkpoint block to start syncing from. Must be aligned and match \
+                       --checkpoint-state. Using --checkpoint-sync-url instead is recommended.")
+                .value_name("BLOCK_SSZ")
+                .takes_value(true)
+                .requires("checkpoint-state")
+        )
+        .arg(
+            Arg::with_name("checkpoint-sync-url")
+                .long("checkpoint-sync-url")
+                .help("Set the remote beacon node HTTP endpoint to use for checkpoint sync.")
+                .value_name("BEACON_NODE")
+                .takes_value(true)
+                .conflicts_with("checkpoint-state")
+        )
+        .arg(
+            Arg::with_name("reconstruct-historic-states")
+                .long("reconstruct-historic-states")
+                .help("After a checkpoint sync, reconstruct historic states in the database.")
+                .takes_value(false)
+        )
+        .arg(
+            Arg::with_name("validator-monitor-auto")
+                .long("validator-monitor-auto")
+                .help("Enables the automatic detection and monitoring of validators connected to the \
+                    HTTP API and using the subnet subscription endpoint. This generally has the \
+                    effect of providing additional logging and metrics for locally controlled \
+                    validators.")
+        )
+        .arg(
+            Arg::with_name("validator-monitor-pubkeys")
+                .long("validator-monitor-pubkeys")
+                .help("A comma-separated list of 0x-prefixed validator public keys. \
+                        These validators will receive special monitoring and additional \
+                        logging.")
+                .value_name("PUBKEYS")
+                .takes_value(true)
+        )
+        .arg(
+            Arg::with_name("validator-monitor-file")
+                .long("validator-monitor-file")
+                .help("As per --validator-monitor-pubkeys, but the comma-separated list is \
+                    contained within a file at the given path.")
+                .value_name("PATH")
                 .takes_value(true)
         )
 }

@@ -6,7 +6,7 @@ use slasher::{
     Config, Slasher,
 };
 use std::collections::HashSet;
-use tempdir::TempDir;
+use tempfile::tempdir;
 use types::{AttesterSlashing, Epoch, IndexedAttestation};
 
 #[test]
@@ -107,7 +107,7 @@ fn surrounds_existing_single_val_single_chunk() {
 fn surrounds_existing_multi_vals_single_chunk() {
     let validators = vec![0, 16, 1024, 300_000, 300_001];
     let att1 = indexed_att(validators.clone(), 1, 2, 0);
-    let att2 = indexed_att(validators.clone(), 0, 3, 0);
+    let att2 = indexed_att(validators, 0, 3, 0);
     let slashings = hashset![att_slashing(&att2, &att1)];
     slasher_test_indiv(&[att1, att2], &slashings, 3);
 }
@@ -169,8 +169,8 @@ fn slasher_test(
     current_epoch: u64,
     should_process_after: impl Fn(usize) -> bool,
 ) {
-    let tempdir = TempDir::new("slasher").unwrap();
-    let config = Config::new(tempdir.path().into());
+    let tempdir = tempdir().unwrap();
+    let config = Config::new(tempdir.path().into()).for_testing();
     let slasher = Slasher::open(config, logger()).unwrap();
     let current_epoch = Epoch::new(current_epoch);
 
@@ -189,6 +189,8 @@ fn slasher_test(
 
     // Pruning should not error.
     slasher.prune_database(current_epoch).unwrap();
+    // windows won't delete the temporary directory if you don't do this..
+    drop(slasher);
 }
 
 fn parallel_slasher_test(
@@ -196,8 +198,8 @@ fn parallel_slasher_test(
     expected_slashed_validators: HashSet<u64>,
     current_epoch: u64,
 ) {
-    let tempdir = TempDir::new("slasher").unwrap();
-    let config = Config::new(tempdir.path().into());
+    let tempdir = tempdir().unwrap();
+    let config = Config::new(tempdir.path().into()).for_testing();
     let slasher = Slasher::open(config, logger()).unwrap();
     let current_epoch = Epoch::new(current_epoch);
 
@@ -212,4 +214,6 @@ fn parallel_slasher_test(
     let slashings = slasher.get_attester_slashings();
     let slashed_validators = slashed_validators_from_slashings(&slashings);
     assert_eq!(slashed_validators, expected_slashed_validators);
+    // windows won't delete the temporary directory if you don't do this..
+    drop(slasher);
 }

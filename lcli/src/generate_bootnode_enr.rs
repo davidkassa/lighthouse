@@ -25,10 +25,12 @@ pub fn run<T: EthSpec>(matches: &ArgMatches) -> Result<(), String> {
         ));
     }
 
-    let mut config = NetworkConfig::default();
-    config.enr_address = Some(ip);
-    config.enr_udp_port = Some(udp_port);
-    config.enr_tcp_port = Some(tcp_port);
+    let config = NetworkConfig {
+        enr_address: Some(ip),
+        enr_udp_port: Some(udp_port),
+        enr_tcp_port: Some(tcp_port),
+        ..Default::default()
+    };
 
     let local_keypair = Keypair::generate_secp256k1();
     let enr_key = CombinedKey::from_libp2p(&local_keypair)?;
@@ -45,7 +47,7 @@ pub fn run<T: EthSpec>(matches: &ArgMatches) -> Result<(), String> {
     let mut enr_file = File::create(output_dir.join(ENR_FILENAME))
         .map_err(|e| format!("Unable to create {}: {:?}", ENR_FILENAME, e))?;
     enr_file
-        .write_all(&enr.to_base64().as_bytes())
+        .write_all(enr.to_base64().as_bytes())
         .map_err(|e| format!("Unable to write ENR to {}: {:?}", ENR_FILENAME, e))?;
 
     let secret_bytes = match local_keypair {

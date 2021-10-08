@@ -2,12 +2,13 @@ use super::{types::*, PK_LEN, SECRET_PREFIX};
 use crate::Error;
 use account_utils::ZeroizeString;
 use bytes::Bytes;
+use libsecp256k1::{Message, PublicKey, Signature};
 use reqwest::{
     header::{HeaderMap, HeaderValue},
     IntoUrl,
 };
 use ring::digest::{digest, SHA256};
-use secp256k1::{Message, PublicKey, Signature};
+use sensitive_url::SensitiveUrl;
 use serde::{de::DeserializeOwned, Serialize};
 
 pub use reqwest;
@@ -18,9 +19,10 @@ pub use reqwest::{Response, StatusCode, Url};
 #[derive(Clone)]
 pub struct ValidatorClientHttpClient {
     client: reqwest::Client,
-    server: Url,
+    server: SensitiveUrl,
     secret: ZeroizeString,
     server_pubkey: PublicKey,
+    send_authorization_header: bool,
 }
 
 /// Parse an API token and return a secp256k1 public key.
@@ -34,7 +36,7 @@ pub fn parse_pubkey(secret: &str) -> Result<PublicKey, Error> {
         &secret[SECRET_PREFIX.len()..]
     };
 
-    serde_utils::hex::decode(&secret)
+    eth2_serde_utils::hex::decode(secret)
         .map_err(|e| Error::InvalidSecret(format!("invalid hex: {:?}", e)))
         .and_then(|bytes| {
             if bytes.len() != PK_LEN {
@@ -53,17 +55,18 @@ pub fn parse_pubkey(secret: &str) -> Result<PublicKey, Error> {
 }
 
 impl ValidatorClientHttpClient {
-    pub fn new(server: Url, secret: String) -> Result<Self, Error> {
+    pub fn new(server: SensitiveUrl, secret: String) -> Result<Self, Error> {
         Ok(Self {
             client: reqwest::Client::new(),
             server,
             server_pubkey: parse_pubkey(&secret)?,
             secret: secret.into(),
+            send_authorization_header: true,
         })
     }
 
     pub fn from_components(
-        server: Url,
+        server: SensitiveUrl,
         client: reqwest::Client,
         secret: String,
     ) -> Result<Self, Error> {
@@ -72,7 +75,16 @@ impl ValidatorClientHttpClient {
             server,
             server_pubkey: parse_pubkey(&secret)?,
             secret: secret.into(),
+            send_authorization_header: true,
         })
+    }
+
+    /// Set to `false` to disable sending the `Authorization` header on requests.
+    ///
+    /// Failing to send the `Authorization` header will cause the VC to reject requests with a 403.
+    /// This function is intended only for testing purposes.
+    pub fn send_authorization_header(&mut self, should_send: bool) {
+        self.send_authorization_header = should_send;
     }
 
     async fn signed_body(&self, response: Response) -> Result<Bytes, Error> {
@@ -89,11 +101,11 @@ impl ValidatorClientHttpClient {
         let message =
             Message::parse_slice(digest(&SHA256, &body).as_ref()).expect("sha256 is 32 bytes");
 
-        serde_utils::hex::decode(&sig)
+        eth2_serde_utils::hex::decode(&sig)
             .ok()
             .and_then(|bytes| {
                 let sig = Signature::parse_der(&bytes).ok()?;
-                Some(secp256k1::verify(&message, &sig, &self.server_pubkey))
+                Some(libsecp256k1::verify(&message, &sig, &self.server_pubkey))
             })
             .filter(|is_valid| *is_valid)
             .ok_or(Error::InvalidSignatureHeader)?;
@@ -107,13 +119,16 @@ impl ValidatorClientHttpClient {
     }
 
     fn headers(&self) -> Result<HeaderMap, Error> {
-        let header_value = HeaderValue::from_str(&format!("Basic {}", self.secret.as_str()))
-            .map_err(|e| {
-                Error::InvalidSecret(format!("secret is invalid as a header value: {}", e))
-            })?;
-
         let mut headers = HeaderMap::new();
-        headers.insert("Authorization", header_value);
+
+        if self.send_authorization_header {
+            let header_value = HeaderValue::from_str(&format!("Basic {}", self.secret.as_str()))
+                .map_err(|e| {
+                    Error::InvalidSecret(format!("secret is invalid as a header value: {}", e))
+                })?;
+
+            headers.insert("Authorization", header_value);
+        }
 
         Ok(headers)
     }
@@ -187,7 +202,7 @@ impl ValidatorClientHttpClient {
 
     /// `GET lighthouse/version`
     pub async fn get_lighthouse_version(&self) -> Result<GenericResponse<VersionData>, Error> {
-        let mut path = self.server.clone();
+        let mut path = self.server.full.clone();
 
         path.path_segments_mut()
             .map_err(|()| Error::InvalidUrl(self.server.clone()))?
@@ -199,7 +214,7 @@ impl ValidatorClientHttpClient {
 
     /// `GET lighthouse/health`
     pub async fn get_lighthouse_health(&self) -> Result<GenericResponse<Health>, Error> {
-        let mut path = self.server.clone();
+        let mut path = self.server.full.clone();
 
         path.path_segments_mut()
             .map_err(|()| Error::InvalidUrl(self.server.clone()))?
@@ -210,8 +225,8 @@ impl ValidatorClientHttpClient {
     }
 
     /// `GET lighthouse/spec`
-    pub async fn get_lighthouse_spec(&self) -> Result<GenericResponse<YamlConfig>, Error> {
-        let mut path = self.server.clone();
+    pub async fn get_lighthouse_spec(&self) -> Result<GenericResponse<ConfigAndPreset>, Error> {
+        let mut path = self.server.full.clone();
 
         path.path_segments_mut()
             .map_err(|()| Error::InvalidUrl(self.server.clone()))?
@@ -225,7 +240,7 @@ impl ValidatorClientHttpClient {
     pub async fn get_lighthouse_validators(
         &self,
     ) -> Result<GenericResponse<Vec<ValidatorData>>, Error> {
-        let mut path = self.server.clone();
+        let mut path = self.server.full.clone();
 
         path.path_segments_mut()
             .map_err(|()| Error::InvalidUrl(self.server.clone()))?
@@ -240,7 +255,7 @@ impl ValidatorClientHttpClient {
         &self,
         validator_pubkey: &PublicKeyBytes,
     ) -> Result<Option<GenericResponse<ValidatorData>>, Error> {
-        let mut path = self.server.clone();
+        let mut path = self.server.full.clone();
 
         path.path_segments_mut()
             .map_err(|()| Error::InvalidUrl(self.server.clone()))?
@@ -256,7 +271,7 @@ impl ValidatorClientHttpClient {
         &self,
         validators: Vec<ValidatorRequest>,
     ) -> Result<GenericResponse<PostValidatorsResponseData>, Error> {
-        let mut path = self.server.clone();
+        let mut path = self.server.full.clone();
 
         path.path_segments_mut()
             .map_err(|()| Error::InvalidUrl(self.server.clone()))?
@@ -271,7 +286,7 @@ impl ValidatorClientHttpClient {
         &self,
         request: &CreateValidatorsMnemonicRequest,
     ) -> Result<GenericResponse<Vec<CreatedValidator>>, Error> {
-        let mut path = self.server.clone();
+        let mut path = self.server.full.clone();
 
         path.path_segments_mut()
             .map_err(|()| Error::InvalidUrl(self.server.clone()))?
@@ -287,7 +302,7 @@ impl ValidatorClientHttpClient {
         &self,
         request: &KeystoreValidatorsPostRequest,
     ) -> Result<GenericResponse<ValidatorData>, Error> {
-        let mut path = self.server.clone();
+        let mut path = self.server.full.clone();
 
         path.path_segments_mut()
             .map_err(|()| Error::InvalidUrl(self.server.clone()))?
@@ -298,13 +313,29 @@ impl ValidatorClientHttpClient {
         self.post(path, &request).await
     }
 
+    /// `POST lighthouse/validators/web3signer`
+    pub async fn post_lighthouse_validators_web3signer(
+        &self,
+        request: &[Web3SignerValidatorRequest],
+    ) -> Result<GenericResponse<ValidatorData>, Error> {
+        let mut path = self.server.full.clone();
+
+        path.path_segments_mut()
+            .map_err(|()| Error::InvalidUrl(self.server.clone()))?
+            .push("lighthouse")
+            .push("validators")
+            .push("web3signer");
+
+        self.post(path, &request).await
+    }
+
     /// `PATCH lighthouse/validators/{validator_pubkey}`
     pub async fn patch_lighthouse_validators(
         &self,
         voting_pubkey: &PublicKeyBytes,
         enabled: bool,
     ) -> Result<(), Error> {
-        let mut path = self.server.clone();
+        let mut path = self.server.full.clone();
 
         path.path_segments_mut()
             .map_err(|()| Error::InvalidUrl(self.server.clone()))?

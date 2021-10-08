@@ -2,9 +2,9 @@ use crate::{
     generic_public_key::{GenericPublicKey, TPublicKey},
     Error, PUBLIC_KEY_BYTES_LEN,
 };
+use eth2_serde_utils::hex::encode as hex_encode;
 use serde::de::{Deserialize, Deserializer};
 use serde::ser::{Serialize, Serializer};
-use serde_utils::hex::encode as hex_encode;
 use ssz::{Decode, Encode};
 use std::convert::TryInto;
 use std::fmt;
@@ -18,10 +18,20 @@ use tree_hash::TreeHash;
 ///
 /// - Lazily verifying a serialized public key.
 /// - Storing some bytes that are actually invalid (required in the case of a `Deposit` message).
-#[derive(Clone)]
 pub struct GenericPublicKeyBytes<Pub> {
     bytes: [u8; PUBLIC_KEY_BYTES_LEN],
     _phantom: PhantomData<Pub>,
+}
+
+impl<Pub> Copy for GenericPublicKeyBytes<Pub> {}
+
+impl<Pub> Clone for GenericPublicKeyBytes<Pub> {
+    fn clone(&self) -> Self {
+        Self {
+            bytes: self.bytes,
+            _phantom: PhantomData,
+        }
+    }
 }
 
 impl<Pub> GenericPublicKeyBytes<Pub>
@@ -57,6 +67,11 @@ impl<Pub> GenericPublicKeyBytes<Pub> {
     /// The bytes are not verified (i.e., they may not represent a valid BLS point).
     pub fn serialize(&self) -> [u8; PUBLIC_KEY_BYTES_LEN] {
         self.bytes
+    }
+
+    /// Returns `self.serialize()` as a `0x`-prefixed hex string.
+    pub fn as_hex_string(&self) -> String {
+        format!("{:?}", self)
     }
 
     /// Instantiates `Self` from bytes.

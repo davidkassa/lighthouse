@@ -1,15 +1,16 @@
 use directory::DEFAULT_ROOT_DIR;
 use network::NetworkConfig;
+use sensitive_url::SensitiveUrl;
 use serde_derive::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use types::Graffiti;
+use types::{Graffiti, PublicKeyBytes};
 
 /// Default directory name for the freezer database under the top-level data dir.
 const DEFAULT_FREEZER_DB_DIR: &str = "freezer_db";
 
 /// Defines how the client should initialize the `BeaconChain` and other components.
-#[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientGenesis {
     /// Creates a genesis state as per the 2019 Canada interop specifications.
     Interop {
@@ -26,6 +27,15 @@ pub enum ClientGenesis {
     /// We include the bytes instead of the `BeaconState<E>` because the `EthSpec` type
     /// parameter would be very annoying.
     SszBytes { genesis_state_bytes: Vec<u8> },
+    WeakSubjSszBytes {
+        genesis_state_bytes: Vec<u8>,
+        anchor_state_bytes: Vec<u8>,
+        anchor_block_bytes: Vec<u8>,
+    },
+    CheckpointSyncUrl {
+        genesis_state_bytes: Vec<u8>,
+        url: SensitiveUrl,
+    },
 }
 
 impl Default for ClientGenesis {
@@ -52,6 +62,10 @@ pub struct Config {
     pub disabled_forks: Vec<String>,
     /// Graffiti to be inserted everytime we create a block.
     pub graffiti: Graffiti,
+    /// When true, automatically monitor validators using the HTTP API.
+    pub validator_monitor_auto: bool,
+    /// A list of validator pubkeys to monitor.
+    pub validator_monitor_pubkeys: Vec<PublicKeyBytes>,
     #[serde(skip)]
     /// The `genesis` field is not serialized or deserialized by `serde` to ensure it is defined
     /// via the CLI at runtime, instead of from a configuration file saved to disk.
@@ -62,6 +76,7 @@ pub struct Config {
     pub eth1: eth1::Config,
     pub http_api: http_api::Config,
     pub http_metrics: http_metrics::Config,
+    pub monitoring_api: Option<monitoring_api::Config>,
     pub slasher: Option<slasher::Config>,
 }
 
@@ -83,7 +98,10 @@ impl Default for Config {
             graffiti: Graffiti::default(),
             http_api: <_>::default(),
             http_metrics: <_>::default(),
+            monitoring_api: None,
             slasher: None,
+            validator_monitor_auto: false,
+            validator_monitor_pubkeys: vec![],
         }
     }
 }
@@ -154,7 +172,6 @@ fn ensure_dir_exists(path: PathBuf) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use toml;
 
     #[test]
     fn serde() {

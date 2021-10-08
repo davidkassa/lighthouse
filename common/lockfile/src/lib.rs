@@ -72,26 +72,33 @@ impl Drop for Lockfile {
 #[cfg(test)]
 mod test {
     use super::*;
-    use tempdir::TempDir;
+    use tempfile::tempdir;
 
     #[cfg(unix)]
     use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
     #[test]
     fn new_lock() {
-        let temp = TempDir::new("lock_test").unwrap();
+        let temp = tempdir().unwrap();
         let path = temp.path().join("lockfile");
-
         let _lock = Lockfile::new(path.clone()).unwrap();
-        assert!(matches!(
-            Lockfile::new(path).unwrap_err(),
-            LockfileError::FileLocked(..)
-        ));
+        if cfg!(windows) {
+            assert!(matches!(
+                Lockfile::new(path).unwrap_err(),
+                // windows returns an IoError because the lockfile is already open :/
+                LockfileError::IoError(..),
+            ));
+        } else {
+            assert!(matches!(
+                Lockfile::new(path).unwrap_err(),
+                LockfileError::FileLocked(..)
+            ));
+        }
     }
 
     #[test]
     fn relock_after_drop() {
-        let temp = TempDir::new("lock_test").unwrap();
+        let temp = tempdir().unwrap();
         let path = temp.path().join("lockfile");
 
         let lock1 = Lockfile::new(path.clone()).unwrap();
@@ -105,19 +112,19 @@ mod test {
 
     #[test]
     fn lockfile_exists() {
-        let temp = TempDir::new("lock_test").unwrap();
+        let temp = tempdir().unwrap();
         let path = temp.path().join("lockfile");
 
         let _lockfile = File::create(&path).unwrap();
 
-        let lock = Lockfile::new(path.clone()).unwrap();
+        let lock = Lockfile::new(path).unwrap();
         assert!(lock.file_existed());
     }
 
     #[test]
     #[cfg(unix)]
     fn permission_denied_create() {
-        let temp = TempDir::new("lock_test").unwrap();
+        let temp = tempdir().unwrap();
         let path = temp.path().join("lockfile");
 
         let lockfile = File::create(&path).unwrap();

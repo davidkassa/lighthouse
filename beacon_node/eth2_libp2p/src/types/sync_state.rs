@@ -10,8 +10,13 @@ pub enum SyncState {
     /// The node is performing a long-range (batch) sync over one or many head chains.
     /// In this state parent lookups are disabled.
     SyncingHead { start_slot: Slot, target_slot: Slot },
-    /// The node has identified the need for is sync operations and is transitioning to a syncing
-    /// state.
+    /// The node is undertaking a backfill sync. This occurs when a user has specified a trusted
+    /// state. The node first syncs "forward" by downloading blocks up to the current head as
+    /// specified by its peers. Once completed, the node enters this sync state and attempts to
+    /// download all required historical blocks to complete its chain.
+    BackFillSyncing { completed: usize, remaining: usize },
+    /// The node has completed syncing a finalized chain and is in the process of re-evaluating
+    /// which sync state to progress to.
     SyncTransition,
     /// The node is up to date with all known peers and is connected to at least one
     /// fully synced peer. In this state, parent lookups are enabled.
@@ -21,16 +26,37 @@ pub enum SyncState {
     Stalled,
 }
 
+#[derive(PartialEq, Debug, Clone, Serialize, Deserialize)]
+/// The state of the backfill sync.
+pub enum BackFillState {
+    /// The sync is partially completed and currently paused.
+    Paused,
+    /// We are currently backfilling.
+    Syncing,
+    /// A backfill sync has completed.
+    Completed,
+    /// A backfill sync is not required.
+    NotRequired,
+    /// Too many failed attempts at backfilling. Consider it failed.
+    Failed,
+}
+
 impl PartialEq for SyncState {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (SyncState::SyncingFinalized { .. }, SyncState::SyncingFinalized { .. }) => true,
-            (SyncState::SyncingHead { .. }, SyncState::SyncingHead { .. }) => true,
-            (SyncState::Synced, SyncState::Synced) => true,
-            (SyncState::Stalled, SyncState::Stalled) => true,
-            (SyncState::SyncTransition, SyncState::SyncTransition) => true,
-            _ => false,
-        }
+        matches!(
+            (self, other),
+            (
+                SyncState::SyncingFinalized { .. },
+                SyncState::SyncingFinalized { .. }
+            ) | (SyncState::SyncingHead { .. }, SyncState::SyncingHead { .. })
+                | (SyncState::Synced, SyncState::Synced)
+                | (SyncState::Stalled, SyncState::Stalled)
+                | (SyncState::SyncTransition, SyncState::SyncTransition)
+                | (
+                    SyncState::BackFillSyncing { .. },
+                    SyncState::BackFillSyncing { .. }
+                )
+        )
     }
 }
 
@@ -41,14 +67,18 @@ impl SyncState {
             SyncState::SyncingFinalized { .. } => true,
             SyncState::SyncingHead { .. } => true,
             SyncState::SyncTransition => true,
+            // Backfill doesn't effect any logic, we consider this state, not syncing.
+            SyncState::BackFillSyncing { .. } => false,
             SyncState::Synced => false,
             SyncState::Stalled => false,
         }
     }
 
     /// Returns true if the node is synced.
+    ///
+    /// NOTE: We consider the node synced if it is fetching old historical blocks.
     pub fn is_synced(&self) -> bool {
-        matches!(self, SyncState::Synced)
+        matches!(self, SyncState::Synced | SyncState::BackFillSyncing { .. })
     }
 }
 
@@ -59,7 +89,8 @@ impl std::fmt::Display for SyncState {
             SyncState::SyncingHead { .. } => write!(f, "Syncing Head Chain"),
             SyncState::Synced { .. } => write!(f, "Synced"),
             SyncState::Stalled { .. } => write!(f, "Stalled"),
-            SyncState::SyncTransition => write!(f, "Searching syncing peers"),
+            SyncState::SyncTransition => write!(f, "Evaluating known peers"),
+            SyncState::BackFillSyncing { .. } => write!(f, "Syncing Historical Blocks"),
         }
     }
 }

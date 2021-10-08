@@ -19,6 +19,7 @@ use processor::Processor;
 use slog::{debug, o, trace};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use types::EthSpec;
 
 /// Handles messages received from the network and client and organises syncing. This
@@ -101,7 +102,7 @@ impl<T: BeaconChainTypes> Router<T> {
         executor.spawn(
             async move {
                 debug!(log, "Network message router started");
-                handler_recv
+                UnboundedReceiverStream::new(handler_recv)
                     .for_each(move |msg| future::ready(handler.handle_message(msg)))
                     .await;
             },
@@ -222,7 +223,12 @@ impl<T: BeaconChainTypes> Router<T> {
                 );
             }
             PubsubMessage::BeaconBlock(block) => {
-                self.processor.on_block_gossip(id, peer_id, block);
+                self.processor.on_block_gossip(
+                    id,
+                    peer_id,
+                    self.network_globals.client(&peer_id),
+                    block,
+                );
             }
             PubsubMessage::VoluntaryExit(exit) => {
                 debug!(self.log, "Received a voluntary exit"; "peer_id" => %peer_id);
@@ -245,6 +251,31 @@ impl<T: BeaconChainTypes> Router<T> {
                 );
                 self.processor
                     .on_attester_slashing_gossip(id, peer_id, attester_slashing);
+            }
+            PubsubMessage::SignedContributionAndProof(contribution_and_proof) => {
+                trace!(
+                    self.log,
+                    "Received sync committee aggregate";
+                    "peer_id" => %peer_id
+                );
+                self.processor.on_sync_committee_contribution_gossip(
+                    id,
+                    peer_id,
+                    *contribution_and_proof,
+                );
+            }
+            PubsubMessage::SyncCommitteeMessage(sync_committtee_msg) => {
+                trace!(
+                    self.log,
+                    "Received sync committee signature";
+                    "peer_id" => %peer_id
+                );
+                self.processor.on_sync_committee_signature_gossip(
+                    id,
+                    peer_id,
+                    sync_committtee_msg.1,
+                    sync_committtee_msg.0,
+                );
             }
         }
     }
